@@ -1,0 +1,136 @@
+################################## Data preprocessing: START ##########################################
+
+import findspark
+findspark.init()
+
+import pyspark # only run after findspark.init()
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.master("local").appName("Customer Churn").config("spark.driver.host", "localhost").getOrCreate()
+
+# Disable warnings, set Matplotlib inline plotting and load Pandas package
+import warnings
+warnings.filterwarnings('ignore')
+%matplotlib inline
+import pandas as pd
+
+##########load the CSV data set into DataFrames, keeping the header information and caching them into memory for quick, repeated access. Also print the schema of the sets.
+telco_data_df = spark.read.option("header", "true").option('inferSchema', 'true').option("mode", "DROPMALFORMED").csv("D:\data\MSC-2020\Semester-1\DataScience-CS5617\Assignment01\TelcoChurnDataset.csv")
+telco_data_df.cache()
+telco_data_df.printSchema()
+
+#use Pandas instead of the Spark DataFrame.show() function because it creates a prettier print.
+pd.DataFrame(telco_data_df.take(5), columns=telco_data_df.columns)
+
+#The describe() function performs summary statistics calculations on all numeric columns, and returns them as a DataFrame.
+telco_data_df.describe().toPandas().transpose()
+
+
+##########Use the Pandas library to examine correlations between the numeric columns by generating scatter plots of them.
+
+#A randomly sample a portion of the data (10%) used for analysis
+numeric_features = [t[0] for t in telco_data_df.dtypes if t[1] == 'int' or t[1] == 'double']
+sampled_data = telco_data_df.select(numeric_features).sample(False, 0.20).toPandas()
+axs = pd.plotting.scatter_matrix(sampled_data, figsize=(12, 12))
+
+# Rotate axis labels and remove axis ticks
+n = len(sampled_data.columns)
+for i in range(n):
+    v = axs[i, 0]
+    v.yaxis.label.set_rotation(0)
+    v.yaxis.label.set_ha('right')
+    v.set_yticks(())
+    h = axs[n-1, i]
+    h.xaxis.label.set_rotation(90)
+    h.set_xticks(())
+	
+#TotalCallDuration and AvgCallDuration are correlated. Therefore drop one column of pair of correlated fields.
+
+##########Final data preparation
+#Transform the categorical data into numeric as required by the machine learning routines, using a simple user-defined function that maps Yes/Male and No/Female to 1 and 0, respectively.
+from pyspark.sql.types import DoubleType
+from pyspark.sql.functions import UserDefinedFunction
+
+binary_map = {'Yes':1.0, 'No':0.0, 'Male':1.0, 'Female':0.0}
+toNum = UserDefinedFunction(lambda k: binary_map[k], DoubleType())
+
+telco_data_final_df = telco_data_df.drop('TotalCallDuration') \
+    .withColumn('Churn', toNum(telco_data_df['isChurned'])) \
+    .withColumn('Gender', toNum(telco_data_df['Gender'])) \
+    .withColumn('isCustomerSuspended', toNum(telco_data_df['isCustomerSuspended'])).cache()
+
+pd.DataFrame(telco_data_final_df.take(5), columns=telco_data_final_df.columns)
+
+################################## Data preprocessing: END ##########################################
+
+
+################################## Predictive model Using the Spark ML Package: START ##########################################
+
+from pyspark.mllib.linalg import Vectors
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, VectorIndexer
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.feature import StringIndexer, VectorAssembler, MinMaxScaler
+
+
+#There are about 10 times as many False churn samples as True churn samples. So, stratified sampling is used to put the two sample types on the same footing. 
+#Here we're keeping all instances of the Churn=True class, but downsampling the Churn=False class to a fraction of 858/8632.
+telco_data_final_df.groupby('Churn').count().toPandas()
+stratified_data = telco_data_final_df.sampleBy('Churn', fractions={0: 858./8632, 1: 1.0}).cache()
+stratified_data.groupby('Churn').count().toPandas()	
+
+
+# Convert to vector with features
+telco_data_final_cols = ["Age", "Gender", "isCustomerSuspended", "CallDropRate", "NumberOfComplaints", "MonthlyBilledAmount - Rs", "UnpaidBalance - Rs", "NumberOfMonthUnpaid", "TotalMinsUsedInLastMonth", "AvgCallDuration", "PercentageCallOutsideNetwork"]
+assembler = VectorAssembler(inputCols=telco_data_final_cols, outputCol='features')
+vectorized_stratified_data = assembler.transform(stratified_data)
+vectorized_telco_data_final_df = assembler.transform(telco_data_final_df)
+
+# Index labels, adding metadata to the label column
+labelIndexer = StringIndexer(inputCol='Churn', outputCol='indexedLabel').fit(vectorized_stratified_data)
+
+# Index the features
+featureIndexer = VectorIndexer(inputCol="features", outputCol="indexedFeatures").fit(vectorized_stratified_data)
+
+# Split the data into training and test sets (30% held out for testing)
+(trainingData, testData) = vectorized_telco_data_final_df.randomSplit([0.8, 0.2])
+							   
+# Train a DecisionTree model
+dTree = DecisionTreeClassifier(labelCol='indexedLabel', featuresCol='indexedFeatures')
+
+# Chain indexers and tree in a Pipeline
+pipeline = Pipeline(stages=[labelIndexer, featureIndexer, dTree])
+
+# Search through decision tree's maxDepth parameter for best model
+paramGrid = ParamGridBuilder().addGrid(dTree.maxDepth, [2,3,4,5,6,7]).build()
+
+# Set F-1 score as evaluation metric for best model selection
+evaluator = MulticlassClassificationEvaluator(labelCol='indexedLabel',predictionCol='prediction', metricName='f1')    
+
+# Set up 3-fold cross validation
+crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=evaluator,
+                          numFolds=3)
+
+# Train model.  This also runs the indexers.
+churn_model = crossval.fit(vectorized_stratified_data)
+
+# Fetch best model
+tree_model = churn_model.bestModel.stages[2]
+print(tree_model)
+
+#DecisionTreeClassificationModel (uid=DecisionTreeClassifier_0c5a732f2dc2) of depth 7 with 115 nodes
+#Tree model produced using the cross-validation process is one with a depth of 7. So it is assumed that a tree depth of 7 will perform well.
+
+#Predictions and Model Evaluation
+predicted_data = churn_model.transform(testData)
+print (evaluator.getMetricName(), 'accuracy:', evaluator.evaluate(predicted_data))
+#f1 accuracy: 0.6849696758911609
+
+predictions = predicted_data.select('CustomerId', 'prediction')
+predictions.toPandas().head()
+
+#Finally, write to csv
+predictions.write.format("csv").option("header", "true").option("inferSchema", "true").option("delimiter", ",").save("D:\data\MSC-2020\Semester-1\DataScience-CS5617\Assignment01\DS-OUT.csv")
